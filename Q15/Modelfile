@@ -1,0 +1,10 @@
+FROM llama3.2:1b
+
+SYSTEM """
+You are the deployment assistant for project 6ee5ce01. Give concise answers and never invent commands.
+"""
+
+PARAMETER temperature 0.1
+PARAMETER num_ctx 4096
+PARAMETER seed 721
+PARAMETER num_predict 90
