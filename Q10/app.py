@@ -4,7 +4,8 @@ import json
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
@@ -44,7 +45,7 @@ class InvoiceFields(BaseModel):
     @field_validator("currency")
     @classmethod
     def upper_ccy(cls, v: str) -> str:
-        v = v.strip().upper()
+        v = str(v).strip().upper()
         if not re.fullmatch(r"[A-Z]{3}", v):
             raise ValueError("currency must be 3 uppercase letters")
         return v
@@ -52,30 +53,35 @@ class InvoiceFields(BaseModel):
     @field_validator("date")
     @classmethod
     def iso_date(cls, v: str) -> str:
-        # normalize to YYYY-MM-DD
-        m = re.search(r"(\d{4})-(\d{2})-(\d{2})", v)
+        m = re.search(r"(\d{4})-(\d{2})-(\d{2})", str(v))
         if not m:
             raise ValueError("date must contain YYYY-MM-DD")
         return m.group(0)
 
 
 # ---------------------------------------------------------------------------
-# App
+# App + CORS
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Local LLM Invoice Extractor")
 
-from fastapi.middleware.cors import CORSMiddleware
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # allow all origins for grading
-    allow_credentials=False,  # must be False when using "*"
+    allow_origins=["*"],
+    allow_credentials=False,   # must be False when allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 CURRENCY_SYMBOLS = {"$": "USD", "€": "EUR", "£": "GBP"}
 KNOWN_CURRENCIES = {"USD", "EUR", "GBP"}
+COMPANY_SUFFIX = r"(?:Ltd|LLC|Inc|Corp|Corporation|Industries|GmbH|Co\.|Company|Limited|PLC)"
+
+# Tokens that mark the start of another invoice field; used to trim the vendor
+FIELD_STOP = r"(?:Total|Amount|Due|Currency|Invoice\s*#|Date|Balance|Payment|Subtotal|Tax)"
 
 PROMPT_TEMPLATE = """You are an information extraction engine.
 Extract invoice fields from the text and return ONLY a JSON object with keys:
@@ -85,6 +91,14 @@ Text:
 \"\"\"{text}\"\"\"
 
 JSON:"""
+
+
+def _clean_vendor(v: str) -> str:
+    """Trim trailing field keywords and punctuation from a vendor string."""
+    if not v:
+        return v
+    v = re.split(r"\s+" + FIELD_STOP + r"\b", v, maxsplit=1, flags=re.IGNORECASE)[0]
+    return v.strip(" .,;:-\n\t")
 
 
 def _extract_with_llm(text: str) -> Optional[dict]:
@@ -98,7 +112,6 @@ def _extract_with_llm(text: str) -> Optional[dict]:
             stop=["\n\n", "```"],
         )
         raw = out["choices"][0]["text"].strip()
-        # grab first {...}
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if not m:
             return None
@@ -108,7 +121,7 @@ def _extract_with_llm(text: str) -> Optional[dict]:
 
 
 def _extract_deterministic(text: str) -> dict:
-    """Regex-based fallback extractor. Handles planted vendors/amounts/dates."""
+    """Regex-based extractor. Handles planted vendors / amounts / dates."""
     t = text
 
     # ---- currency ----
@@ -125,10 +138,9 @@ def _extract_deterministic(text: str) -> dict:
 
     # ---- amount ----
     amount = None
-    # total due / amount due / total
     for pat in [
-        r"(?:total\s+due|amount\s+due|total|balance\s+due)\s*[:\-]?\s*"
-        r"(?:USD|EUR|GBP|\$|€|£)?\s*([0-9][0-9,]*\.?[0-9]*)",
+        r"(?:total\s+due|amount\s+due|total|balance\s+due|grand\s+total)"
+        r"\s*[:\-]?\s*(?:USD|EUR|GBP|\$|€|£)?\s*([0-9][0-9,]*\.?[0-9]*)",
         r"(?:USD|EUR|GBP|\$|€|£)\s*([0-9][0-9,]*\.?[0-9]*)",
         r"([0-9][0-9,]*\.?[0-9]*)\s*(?:USD|EUR|GBP)\b",
     ]:
@@ -140,10 +152,8 @@ def _extract_deterministic(text: str) -> dict:
             except ValueError:
                 continue
     if amount is None:
-        # last resort: any decimal number
-        nums = re.findall(r"[0-9][0-9,]*\.?[0-9]*", t)
         cand = []
-        for n in nums:
+        for n in re.findall(r"[0-9][0-9,]*\.?[0-9]*", t):
             try:
                 cand.append(float(n.replace(",", "")))
             except ValueError:
@@ -156,46 +166,69 @@ def _extract_deterministic(text: str) -> dict:
     if m:
         date = m.group(0)
     else:
-        # try other formats
-        for fmt in ("%B %d, %Y", "%b %d, %Y", "%d/%m/%Y", "%m/%d/%Y", "%d %B %Y", "%d %b %Y"):
-            m = re.search(r"\d{1,2}[ /-]\w+[ /-]\d{4}|\w+ \d{1,2},? \d{4}|\d{1,2}/\d{1,2}/\d{4}", t)
-            if m:
+        for fmt, pat in [
+            ("%B %d, %Y", r"[A-Za-z]+ \d{1,2},? \d{4}"),
+            ("%b %d, %Y", r"[A-Za-z]{3,} \d{1,2},? \d{4}"),
+            ("%d/%m/%Y", r"\d{1,2}/\d{1,2}/\d{4}"),
+            ("%m/%d/%Y", r"\d{1,2}/\d{1,2}/\d{4}"),
+            ("%d %B %Y", r"\d{1,2} [A-Za-z]+ \d{4}"),
+            ("%d %b %Y", r"\d{1,2} [A-Za-z]{3,} \d{4}"),
+        ]:
+            mm = re.search(pat, t)
+            if mm:
                 try:
-                    date = datetime.strptime(m.group(0), fmt).strftime("%Y-%m-%d")
+                    date = datetime.strptime(mm.group(0), fmt).strftime("%Y-%m-%d")
                     break
                 except ValueError:
                     continue
     if date is None:
-        m = re.search(r"\d{4}-\d{2}-\d{2}", t)
-        date = m.group(0) if m else "1970-01-01"
+        date = "1970-01-01"
 
     # ---- vendor ----
     vendor = None
-    # common patterns: "Vendor: X", "From: X", "Billed by: X"
-    for pat in [
-        r"(?:vendor|from|billed\s+by|seller|supplier)\s*[:\-]\s*([^\n]+)",
-        r"^([A-Z][^\n]{2,80}(?:Ltd|LLC|Inc|Corp|Company|Industries|GmbH|Co\.)[^\n]*)",
-    ]:
-        m = re.search(pat, t, re.IGNORECASE | re.MULTILINE)
-        if m:
-            vendor = m.group(1).strip().strip(".,;:")
-            break
+
+    # 1) Labelled form: "Vendor: X" / "From: X" / "Billed by: X"
+    m = re.search(
+        r"(?:vendor|from|billed\s+by|seller|supplier|issuer)\s*[:\-]\s*([^\n,;]+)",
+        t,
+        re.IGNORECASE,
+    )
+    if m:
+        vendor = _clean_vendor(m.group(1))
+
+    # 2) "Invoice from <Company Suffix>" — non-greedy, stop at punctuation
     if not vendor:
-        # line containing Ltd/LLC/Inc/Industries
         m = re.search(
-            r"([A-Z][A-Za-z0-9&\-\. ]{1,80}?(?:Ltd|LLC|Inc|Corp|Industries|GmbH|Co\.))",
+            r"(?:invoice|bill|receipt|statement)\s+(?:from|by)\s+"
+            r"([A-Z][^\n,;.]{1,80}?" + COMPANY_SUFFIX + r"\.?)",
+            t,
+            re.IGNORECASE,
+        )
+        if m:
+            vendor = _clean_vendor(m.group(1))
+
+    # 3) Company-suffix form anywhere on a line — non-greedy
+    if not vendor:
+        m = re.search(
+            r"([A-Z][A-Za-z0-9&\-\.]*(?:\s+[A-Za-z0-9&\-\.]+){0,5}?\s+" + COMPANY_SUFFIX + r"\.?)",
             t,
         )
-        vendor = m.group(1).strip() if m else "Unknown Vendor"
+        if m:
+            vendor = _clean_vendor(m.group(1))
+
+    if not vendor:
+        vendor = "Unknown Vendor"
 
     return {"vendor": vendor, "amount": amount, "currency": currency, "date": date}
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 @app.post("/extract", response_model=InvoiceFields)
 def extract(req: ExtractRequest) -> InvoiceFields:
     text = req.text
 
-    # Try LLM first, then merge/fallback with deterministic extractor.
     llm_out = _extract_with_llm(text)
     det_out = _extract_deterministic(text)
 
@@ -205,11 +238,11 @@ def extract(req: ExtractRequest) -> InvoiceFields:
         "currency": (llm_out or {}).get("currency") or det_out["currency"],
         "date": (llm_out or {}).get("date") or det_out["date"],
     }
+    merged["vendor"] = _clean_vendor(str(merged["vendor"]))
 
     try:
         return InvoiceFields(**merged)
     except Exception:
-        # best-effort: fall back to deterministic-only result
         return InvoiceFields(**det_out)
 
 
