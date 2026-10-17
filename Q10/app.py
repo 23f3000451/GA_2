@@ -64,6 +64,16 @@ class InvoiceFields(BaseModel):
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Local LLM Invoice Extractor")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],      # allow all origins for grading
+    allow_credentials=False,  # must be False when using "*"
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 CURRENCY_SYMBOLS = {"$": "USD", "€": "EUR", "£": "GBP"}
 KNOWN_CURRENCIES = {"USD", "EUR", "GBP"}
 
