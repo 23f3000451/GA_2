@@ -4,22 +4,23 @@ from collections import defaultdict, deque
 from typing import Deque, Dict
 
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 # ============================================================
-# YOUR ASSIGNED VALUES — EDIT THESE TWO
+# YOUR ASSIGNED VALUES — EDIT THESE
 # ============================================================
-EMAIL = "your.login@example.com"                 # <- your logged-in email
-EXAM_PAGE_ORIGIN = "https://exam.example.com"    # <- the exam page origin shown in your browser
+EMAIL = "23f3000451@ds.study.iitm.ac.in"                 # EDIT: your real logged-in email
+EXAM_PAGE_ORIGIN = "https://exam.sanand.workers.dev"    # EDIT: output of `location.origin` in the exam page
 
-ALLOWED_ORIGIN = "https://app-qnu8sj.example.com"
+ALLOWED_ORIGIN = "https://app-qnu8sj.example.com"   # do NOT change (assigned)
 BUCKET_B = 14
 WINDOW_SECONDS = 10.0
 
 app = FastAPI()
 
+
 # ============================================================
-# Middleware 3 — Per-client rate limiting (pure ASGI)
+# Middleware 3 — Per-client rate limiting (pure ASGI, outermost)
 # ============================================================
 class RateLimitMiddleware:
     def __init__(self, app, limit: int, window: float):
@@ -32,7 +33,7 @@ class RateLimitMiddleware:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
 
-        # only rate-limit GET /ping
+        # Only rate-limit GET /ping
         if scope.get("path") != "/ping" or scope.get("method") != "GET":
             return await self.app(scope, receive, send)
 
@@ -51,15 +52,24 @@ class RateLimitMiddleware:
                 (b"content-type", b"application/json"),
                 (b"retry-after", str(int(retry_after) + 1).encode()),
             ]
+            # Preserve CORS on 429 for the allowed origins
             origin_b = headers.get(b"origin")
-            if origin_b and origin_b.decode() in (ALLOWED_ORIGIN, EXAM_PAGE_ORIGIN):
-                resp_headers.append((b"access-control-allow-origin", origin_b))
-            await send({"type": "http.response.start", "status": 429, "headers": resp_headers})
+            if origin_b:
+                origin = origin_b.decode()
+                if origin in (ALLOWED_ORIGIN, EXAM_PAGE_ORIGIN):
+                    resp_headers.append((b"access-control-allow-origin", origin.encode()))
+                    resp_headers.append((b"access-control-expose-headers", b"X-Request-ID"))
+            await send({
+                "type": "http.response.start",
+                "status": 429,
+                "headers": resp_headers,
+            })
             await send({"type": "http.response.body", "body": b'{"detail":"Too Many Requests"}'})
             return
 
         bucket.append(now)
         await self.app(scope, receive, send)
+
 
 # ============================================================
 # Middleware 1 — Request-context propagator (pure ASGI)
@@ -87,26 +97,73 @@ class RequestContextMiddleware:
 
         await self.app(scope, receive, send_wrapper)
 
+
 # ============================================================
-# Middleware 2 — Scoped CORS
+# Middleware 2 — Scoped CORS (pure ASGI, no wildcards ever)
+#   - Explicitly allows ALLOWED_ORIGIN and EXAM_PAGE_ORIGIN
+#   - Handles preflight OPTIONS
+#   - Silently drops ACAO for any other origin
 # ============================================================
-# Order: last added = outermost. We want rate limiter outermost so its
-# own 429 still gets CORS (handled manually above), then CORS, then
-# request-context wrapping the app.
+class ScopedCORSMiddleware:
+    def __init__(self, app, allowed_origins):
+        self.app = app
+        self.allowed_origins = set(allowed_origins)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        headers = dict(scope.get("headers") or [])
+        origin_b = headers.get(b"origin")
+        origin = origin_b.decode() if origin_b else None
+        origin_allowed = origin is not None and origin in self.allowed_origins
+
+        # Preflight
+        if scope.get("method") == "OPTIONS" and origin is not None:
+            resp_headers = [
+                (b"vary", b"Origin"),
+                (b"access-control-allow-methods", b"GET, OPTIONS"),
+                (b"access-control-allow-headers", b"*"),
+                (b"access-control-expose-headers", b"X-Request-ID"),
+                (b"access-control-max-age", b"600"),
+            ]
+            if origin_allowed:
+                resp_headers.append((b"access-control-allow-origin", origin.encode()))
+            await send({
+                "type": "http.response.start",
+                "status": 200,
+                "headers": resp_headers,
+            })
+            await send({"type": "http.response.body", "body": b""})
+            return
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                hdrs = list(message.get("headers") or [])
+                hdrs.append((b"vary", b"Origin"))
+                if origin_allowed:
+                    hdrs.append((b"access-control-allow-origin", origin.encode()))
+                    hdrs.append((b"access-control-expose-headers", b"X-Request-ID"))
+                message = {**message, "headers": hdrs}
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+# ============================================================
+# Register middleware — order matters (last added = outermost)
+#   Request context wraps the route; CORS wraps that; rate-limit outermost.
+# ============================================================
 app.add_middleware(RequestContextMiddleware)
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[ALLOWED_ORIGIN, EXAM_PAGE_ORIGIN],
-    allow_credentials=False,
-    allow_methods=["GET", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["X-Request-ID"],
-    max_age=600,
+    ScopedCORSMiddleware,
+    allowed_origins=[ALLOWED_ORIGIN, EXAM_PAGE_ORIGIN],
 )
 app.add_middleware(RateLimitMiddleware, limit=BUCKET_B, window=WINDOW_SECONDS)
 
+
 # ============================================================
-# Route
+# Routes
 # ============================================================
 @app.get("/ping")
 async def ping(request: Request):
