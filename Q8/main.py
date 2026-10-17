@@ -78,7 +78,7 @@ async def work(n: int = Query(1, ge=0, le=1_000_000)):
     # Keep it lightweight but real: n iterations
     for i in range(n):
         total += i
-    return {"email": "student@example.com", "done": n}
+    return {"email": "23f3000451@ds.study.iitm.ac.in", "done": n}
 
 
 @app.get("/metrics")
@@ -118,3 +118,4 @@ async def logs_tail(limit: int = Query(50, ge=1, le=2000)):
 @app.get("/")
 async def root():
     return {"service": "observability-demo", "endpoints": ["/work", "/metrics", "/healthz", "/logs/tail"]}
+
